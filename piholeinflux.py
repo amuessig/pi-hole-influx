@@ -6,29 +6,16 @@ from time import sleep, localtime, strftime
 from influxdb import InfluxDBClient
 from configparser import ConfigParser
 from os import path
+from shutil import copyfile
 import traceback
 import sdnotify
 import sys
 
 HERE = path.dirname(path.realpath(__file__))
-config = ConfigParser()
-config.read(path.join(HERE, 'config.ini'))
+CONFIG_FILE = path.join(HERE, 'config.ini')
 
-INFLUXDB_SERVER = config['influxdb'].get('hostname', '127.0.0.1')
-INFLUXDB_PORT = config['influxdb'].getint('port', 8086)
-INFLUXDB_USERNAME = config['influxdb']['username']
-INFLUXDB_PASSWORD = config['influxdb']['password']
-INFLUXDB_DATABASE = config['influxdb']['database']
-REPORTING_INTERVAL = config['influxdb'].getint('reporting_interval', 10)
-
-INFLUXDB_CLIENT = InfluxDBClient(INFLUXDB_SERVER,
-                                 INFLUXDB_PORT,
-                                 INFLUXDB_USERNAME,
-                                 INFLUXDB_PASSWORD,
-                                 INFLUXDB_DATABASE)
 
 n = sdnotify.SystemdNotifier()
-n.notify("READY=1")
 
 
 class Pihole(object):
@@ -45,38 +32,68 @@ class Pihole(object):
             return response.json()
 
 
-def send_msg(resp, name):
-    if 'gravity_last_updated' in resp:
-        del resp['gravity_last_updated']
+class Daemon(object):
+    def __init__(self, config):
+        self.influx = InfluxDBClient(
+            host=config['influxdb'].get('hostname', '127.0.0.1'),
+            port=config['influxdb'].getint('port', 8086),
+            username=config['influxdb']['username'],
+            password=config['influxdb']['password'],
+            database=config['influxdb']['database']
+        )
 
-    json_body = [
-        {
-            "measurement": "pihole",
-            "tags": {
-                "host": name
-            },
-            "fields": resp
-        }
-    ]
+        self.piholes = [
+            Pihole(config[s]) for s in config.sections()
+            if s != "influxdb"
+        ]
 
-    INFLUXDB_CLIENT.write_points(json_body)
+        self.interval = config['influxdb'].getint('reporting_interval', 10)
+
+    def run(self):
+        while True:
+            for pi in self.piholes:
+                data = pi.get_data()
+                self.send_msg(data, pi.name)
+            timestamp = strftime('%Y-%m-%d %H:%M:%S %z', localtime())
+
+            n.notify('STATUS=Last report to InfluxDB at {}'.format(timestamp))
+            n.notify("READY=1")
+            sleep(self.interval)
+
+    def send_msg(self, resp, name):
+        if 'gravity_last_updated' in resp:
+            del resp['gravity_last_updated']
+
+        json_body = [
+            {
+                "measurement": "pihole",
+                "tags": {
+                    "host": name
+                },
+                "fields": resp
+            }
+        ]
+
+        self.influx.write_points(json_body)
 
 
 if __name__ == '__main__':
-    piholes = [Pihole(config[s]) for s in config.sections() if s != "influxdb"]
-    while True:
-        try:
-            for pi in piholes:
-                data = pi.get_data()
-                send_msg(data, pi.name)
-            timestamp = strftime('%Y-%m-%d %H:%M:%S %z', localtime())
-            n.notify('STATUS=Reported to InfluxDB at {}'.format(timestamp))
+    config = ConfigParser()
+    config.read(CONFIG_FILE)
 
-        except Exception as e:
-            msg = 'Failed, to report to InfluxDB:'
-            n.notify('STATUS={} {}'.format(msg, str(e)))
-            print(msg, str(e))
-            print(traceback.format_exc())
-            sys.exit(1)
+    if len(config) < 2 and not path.isfile(CONFIG_FILE):
+        copyfile(path.join(HERE, "config.ini.example"), CONFIG_FILE)
+        print("Created config file from example. Please "
+              "modify to your needs, and restart.")
+        sys.exit(0)
 
-        sleep(REPORTING_INTERVAL)
+    daemon = Daemon(config)
+
+    try:
+        daemon.run()
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as e:
+        print(str(e))
+        print(traceback.format_exc())
+        sys.exit(1)
